@@ -2,12 +2,11 @@
 # Filename: predictors/process_vits.py
 # Description: Process images with Vision Transformer (ViT) model and search by KNN embeddings in Redis vector store
 import os
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import redis
+import redis  # type: ignore
 import torch
-from PIL import Image
+from PIL import Image  # type: ignore
 from transformers import AutoModel, AutoImageProcessor  # type: ignore
 from typing import List
 
@@ -42,13 +41,14 @@ class ViTWrapper:
 
     def preprocess_images(self, image_paths: List[str]):
         debug(f"Preprocessing {len(image_paths)} images")
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            images = list(executor.map(lambda p: Image.open(p).convert("RGB"), image_paths))
-        inputs = self.processor(images=images, return_tensors="pt")
-        debug(f"Done preprocessing {len(image_paths)} images, batch size is {inputs['pixel_values'].shape[0]}")
-        return inputs
+        for i in range(0, len(image_paths), self.batch_size):
+            batch_paths = image_paths[i : i + self.batch_size]
+            images = [Image.open(p).convert("RGB") for p in batch_paths]
+            inputs = self.processor(images=images, return_tensors="pt")
+            debug(f"Done preprocessing batch of {len(batch_paths)} images")
+            yield inputs
 
-    def get_image_embeddings(self, inputs: torch.Tensor):
+    def get_image_embeddings(self, inputs):
         """get embeddings for a batch of images"""
         debug(f"Getting embeddings for batch of size {inputs['pixel_values'].shape[0]}")
         debug(inputs["pixel_values"].shape)  # Should be (B, 3, H, W)
@@ -70,10 +70,8 @@ class ViTWrapper:
         ids = []
 
         info(f"Found {len(image_paths)} images to predict")
-        for i in range(0, len(image_paths), self.batch_size):
-            batch = image_paths[i : i + self.batch_size]
-            images = self.preprocess_images(batch)
-            embeddings = self.get_image_embeddings(images)
+        for inputs in self.preprocess_images(image_paths):
+            embeddings = self.get_image_embeddings(inputs)
             info(f"Searching for {len(embeddings)} embeddings in Redis")
             for j, emb in enumerate(embeddings):
                 r = self.vs.search_vector(emb.tobytes(), top_n=top_n)
@@ -97,10 +95,8 @@ class ViTWrapper:
         all_embeddings = []
 
         info(f"Found {len(image_paths)} images to get embeddings")
-        for i in range(0, len(image_paths), self.batch_size):
-            batch = image_paths[i : i + self.batch_size]
-            images = self.preprocess_images(batch)
-            embeddings = self.get_image_embeddings(images)
+        for inputs in self.preprocess_images(image_paths):
+            embeddings = self.get_image_embeddings(inputs)
             for emb in embeddings:
                 all_embeddings.append(emb.tolist())
 
