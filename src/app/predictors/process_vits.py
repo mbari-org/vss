@@ -6,13 +6,15 @@ import os
 import numpy as np
 import redis  # type: ignore
 import torch
-from PIL import Image  # type: ignore
+from PIL import Image, ImageFile  # type: ignore
 from transformers import AutoModel, AutoImageProcessor  # type: ignore
-from typing import List
+from typing import Iterator, List, Tuple
 
 from app.predictors.vector_similarity import VectorSimilarity
 
 import logging
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logging.basicConfig(level=logging.DEBUG)
 debug = logging.debug
@@ -39,14 +41,30 @@ class ViTWrapper:
     def vector_dimensions(self) -> int:
         return self.model.config.hidden_size
 
-    def preprocess_images(self, image_paths: List[str]):
+    def preprocess_images(self, image_paths: List[str]) -> Iterator[Tuple[dict, List[str], List[str]]]:
         debug(f"Preprocessing {len(image_paths)} images")
         for i in range(0, len(image_paths), self.batch_size):
             batch_paths = image_paths[i : i + self.batch_size]
-            images = [Image.open(p).convert("RGB") for p in batch_paths]
+            images = []
+            valid_paths = []
+            failed_paths = []
+            for p in batch_paths:
+                try:
+                    img = Image.open(p)
+                    img.load()
+                    images.append(img.convert("RGB"))
+                    valid_paths.append(p)
+                except Exception as e:
+                    logger.warning(f"Skipping unreadable image {p}: {e}")
+                    failed_paths.append(p)
+            if not images:
+                logger.warning(f"No valid images in batch starting at index {i}, skipping")
+                continue
+            if failed_paths:
+                logger.warning(f"Batch reduced from {len(batch_paths)} to {len(images)} images due to read errors")
             inputs = self.processor(images=images, return_tensors="pt")
-            debug(f"Done preprocessing batch of {len(batch_paths)} images")
-            yield inputs
+            debug(f"Done preprocessing batch of {len(images)} images")
+            yield inputs, valid_paths, failed_paths
 
     def get_image_embeddings(self, inputs):
         """get embeddings for a batch of images"""
@@ -70,7 +88,7 @@ class ViTWrapper:
         ids = []
 
         info(f"Found {len(image_paths)} images to predict")
-        for inputs in self.preprocess_images(image_paths):
+        for inputs, _, _ in self.preprocess_images(image_paths):
             embeddings = self.get_image_embeddings(inputs)
             info(f"Searching for {len(embeddings)} embeddings in Redis")
             for j, emb in enumerate(embeddings):
@@ -90,14 +108,18 @@ class ViTWrapper:
 
         return predictions, scores, ids
 
-    def get_embeddings(self, image_paths: List[str]) -> List[List[float]]:
-        """Get embeddings for a batch of images"""
+    def get_embeddings(self, image_paths: List[str], filenames: List[str] | None = None) -> Tuple[List[List[float]], List[str]]:
+        """Get embeddings for a batch of images. Returns (embeddings, failed_filenames)."""
         all_embeddings = []
+        failed_paths: List[str] = []
+        path_to_filename = dict(zip(image_paths, filenames)) if filenames else {}
 
         info(f"Found {len(image_paths)} images to get embeddings")
-        for inputs in self.preprocess_images(image_paths):
+        for inputs, valid_paths, batch_failed_paths in self.preprocess_images(image_paths):
+            failed_paths.extend(batch_failed_paths)
             embeddings = self.get_image_embeddings(inputs)
             for emb in embeddings:
                 all_embeddings.append(emb.tolist())
 
-        return all_embeddings
+        failed_filenames = [path_to_filename.get(p, p) for p in failed_paths]
+        return all_embeddings, failed_filenames

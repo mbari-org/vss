@@ -25,7 +25,7 @@ v = ViTWrapper(r, device, DEFAULT_MODEL)
 
 for image_path in test_images.glob("*.png"):
     print(f"Processing image: {image_path}")
-    inputs = v.preprocess_images([image_path.as_posix()])
+    inputs, _, _ = next(v.preprocess_images([image_path.as_posix()]))
     emb = v.get_image_embeddings(inputs)
     emb = emb.astype(np.float32)
     print(f"Loaded embedding for {image_path}: {emb.shape} to redis")

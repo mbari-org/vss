@@ -46,8 +46,10 @@ def test_embed_endpoint():
 
     assert "filenames" in result, f"Missing 'filenames' in result: {result.keys()}"
     assert "embeddings" in result, f"Missing 'embeddings' in result: {result.keys()}"
+    assert "failed_filenames" in result, f"Missing 'failed_filenames' in result: {result.keys()}"
 
     assert result["filenames"] == ["elephant.jpg"], f"Expected filenames ['elephant.jpg'], got {result['filenames']}"
+    assert result["failed_filenames"] == [], f"Expected no failed filenames, got {result['failed_filenames']}"
 
     embeddings = result["embeddings"]
     assert len(embeddings) == 1, f"Expected 1 embedding, got {len(embeddings)}"
