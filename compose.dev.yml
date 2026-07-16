@@ -9,7 +9,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - redis-stack-server  --port 6379 --appendonly yes --appendfsync everysec --requirepass "$${REDIS_PASSWD:?REDIS_PASSWD variable is not set}"
+      - redis-stack-server  --port 6379 --appendonly yes --appendfsync everysec --auto-aof-rewrite-percentage 200 --no-appendfsync-on-rewrite yes --requirepass "$${REDIS_PASSWD:?REDIS_PASSWD variable is not set}"
     image: redis/redis-stack-server
     container_name: redis-stack-vss-dev
     ports:

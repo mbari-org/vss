@@ -117,12 +117,13 @@ def get_embeddings_task(v_config: dict, image_data: List[bytes], filenames: List
     try:
         logger.info(f"Getting embeddings for {len(temp_paths)} images using model {v_config['model']} on device {v_config['device']}")
         predictor = _predictor_stack.top
-        embeddings = predictor.get_embeddings(temp_paths)
+        embeddings, failed_filenames = predictor.get_embeddings(temp_paths, filenames)
         gc.collect()
 
         output_final = {
             "filenames": filenames,
             "embeddings": embeddings,
+            "failed_filenames": failed_filenames,
         }
         return output_final
     except Exception as e:

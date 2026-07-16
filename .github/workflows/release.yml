@@ -52,6 +52,7 @@ jobs:
         if: steps.release-status.outputs.released == 'true'
         run: |
           docker login -u ${{ secrets.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_TOKEN }}
+          VERSION_NO_V="${RELEASE_VERSION#v}"
           docker buildx create --name mybuilder --platform linux/amd64,linux/arm64 --use
-          docker buildx build --no-cache --sbom=true --provenance=true --push --platform linux/amd64,linux/arm64 -t mbari/vss:$RELEASE_VERSION -t mbari/vss:latest --build-arg IMAGE_URI=mbari/vss:$RELEASE_VERSION -f Dockerfile .
-          docker buildx build --no-cache --sbom=true --provenance=true --push --platform linux/amd64 -t mbari/vss:$RELEASE_VERSION-cuda124 --build-arg IMAGE_URI=mbari/vss:$RELEASE_VERSION-cuda124 -f Dockerfile.cuda .
+          docker buildx build --no-cache --sbom=true --provenance=true --push --platform linux/amd64,linux/arm64 -t mbari/vss:$VERSION_NO_V -t mbari/vss:latest --build-arg IMAGE_URI=mbari/vss:$VERSION_NO_V -f Dockerfile .
+          docker buildx build --no-cache --sbom=true --provenance=true --push --platform linux/amd64 -t mbari/vss:$VERSION_NO_V-cuda124 --build-arg IMAGE_URI=mbari/vss:$VERSION_NO_V-cuda124 -f Dockerfile.cuda .
