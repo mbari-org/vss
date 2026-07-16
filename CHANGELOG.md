@@ -2,6 +2,50 @@
 
 
 
+## v0.16.0 (2026-07-16)
+
+### Feature
+
+* feat: Bump huggingface_hub to support DINOv3 (#13)
+
+* build: strip v prefix from release docker tags
+
+Normalize semantic-release versions before docker push so image tags publish as mbari/vss:0.1.2 instead of mbari/vss:v0.1.2.
+
+Made-with: Cursor
+
+* increase performance with batch
+
+* perf: improve batching
+
+* fix: skip corrupt images during embedding and report failed filenames
+
+Handle truncated or unreadable images without failing the whole batch, and return failed_filenames in embedding job results.
+
+Co-authored-by: Cursor &lt;cursoragent@cursor.com&gt;
+
+---------
+
+Co-authored-by: Cursor &lt;cursoragent@cursor.com&gt; ([`52acb24`](https://github.com/mbari-org/vss/commit/52acb2489acdd32c2cd366ad7464b2d8625dd81c))
+
+### Unknown
+
+* Add non-root user to all Docker images (#11)
+
+* Initial plan
+
+* Add non-root user (1001:1001) to Dockerfile and Dockerfile.cuda with overridable ARG
+
+Agent-Logs-Url: https://github.com/mbari-org/vss/sessions/81fed97a-54da-4d92-aa46-3c7802b12681
+
+Co-authored-by: danellecline &lt;1424813+danellecline@users.noreply.github.com&gt;
+
+---------
+
+Co-authored-by: copilot-swe-agent[bot] &lt;198982749+Copilot@users.noreply.github.com&gt;
+Co-authored-by: danellecline &lt;1424813+danellecline@users.noreply.github.com&gt; ([`6784c22`](https://github.com/mbari-org/vss/commit/6784c222ead3fe5bb673eb4a5a3351629882c54c))
+
+
 ## v0.15.0 (2026-03-26)
 
 ### Build
