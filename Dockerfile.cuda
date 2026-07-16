@@ -57,6 +57,18 @@ ENV IN_DOCKER=1
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
+# Make the image uid-agnostic: the container may be run with an arbitrary uid
+# (e.g. compose `user: 12078:20`) that has no /etc/passwd entry. torch._dynamo,
+# imported transitively by transformers, calls getpass.getuser() at import time,
+# which raises KeyError on an unknown uid. Setting USER/HOME makes getpass short-
+# circuit on the env var, and routing torch/HF caches to world-writable /tmp keeps
+# them writable for any uid (needed for the optional VSS_TORCH_COMPILE path).
+ENV USER=appuser
+ENV HOME=/tmp
+ENV XDG_CACHE_HOME=/tmp/.cache
+ENV TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
+ENV TRITON_CACHE_DIR=/tmp/triton
+
 WORKDIR $APP_HOME
 COPY --from=builder /venv /venv
 COPY . .
