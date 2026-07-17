@@ -2,6 +2,61 @@
 
 
 
+## v0.16.1 (2026-07-17)
+
+### Performance
+
+* perf: fp16 autocast, parallel Redis KNN, and Docker runtime fixes (#14)
+
+* perf: fp16 autocast inference and parallel Redis KNN search
+
+Speed up inference throughput on two fronts:
+- process_vits: run the ViT forward pass under fp16 autocast (CUDA) with
+  model.eval() and torch.inference_mode(), non-blocking host-&gt;device copies,
+  and an optional torch.compile path. Embeddings are cast back to float32 to
+  match the FLOAT32 Redis index. Toggle via VSS_AMP / VSS_TORCH_COMPILE.
+- vector_similarity: add search_vectors() to issue a batch of KNN queries
+  concurrently over the connection pool instead of one serial round-trip per
+  image; predict() now uses it. Concurrency tunable via VSS_KNN_WORKERS.
+
+Co-authored-by: Cursor &lt;cursoragent@cursor.com&gt;
+
+* fix(docker): make image uid-agnostic to avoid getpass.getuser KeyError
+
+torch._dynamo (imported transitively by transformers) calls getpass.getuser()
+at import time, which raises KeyError when the container runs as an arbitrary
+uid with no /etc/passwd entry (e.g. compose `user: 12078:20`). Set USER/HOME so
+getpass short-circuits on the env var, and route torch/HF caches to writable
+/tmp so the optional torch.compile path works for any uid.
+
+Co-authored-by: Cursor &lt;cursoragent@cursor.com&gt;
+
+* fix: enable torch.compile toolchain and add eager fallback
+
+Switch the runtime image to the CUDA devel base (plus python3.11-dev) so the
+Inductor/Triton backend used by VSS_TORCH_COMPILE=1 has the gcc/nvcc toolchain
+and headers it JIT-compiles against, fixing the &#34;Failed to find C compiler&#34;
+error. Also catch lazy torch.compile failures on the first forward and fall
+back to eager execution so a compile problem no longer fails every prediction.
+
+Co-authored-by: Cursor &lt;cursoragent@cursor.com&gt;
+
+* fix(docker): revert to CUDA base image to fix cuBLAS init failure
+
+The devel image sets LD_LIBRARY_PATH=/usr/local/cuda/lib64, which shadows the
+CUDA libraries bundled with the pip torch wheel and caused
+CUBLAS_STATUS_NOT_INITIALIZED (cublasLtMatmulAlgoGetHeuristic) at runtime.
+Revert to the lightweight base image and install just gcc/g++ so the optional
+VSS_TORCH_COMPILE (Triton) path still has a C/C++ compiler without dragging in
+the conflicting system CUDA libs.
+
+Co-authored-by: Cursor &lt;cursoragent@cursor.com&gt;
+
+---------
+
+Co-authored-by: Cursor &lt;cursoragent@cursor.com&gt; ([`f0fc937`](https://github.com/mbari-org/vss/commit/f0fc9372f3a17c723a01f9a44fb4cda336775ba3))
+
+
 ## v0.16.0 (2026-07-16)
 
 ### Feature
