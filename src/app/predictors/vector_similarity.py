@@ -1,12 +1,19 @@
 # fastapi-vss, Apache-2.0 license
 # Filename: predictors/vector_similarity.py
 # Description: Runs operations on Redis database with RediSearch on embedded vectors
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import redis
 from redis.commands.search.field import TagField, VectorField
 from redis.commands.search.indexDefinition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
 
 from app.logger import err, info, debug
+
+# Number of concurrent Redis KNN queries per batch (redis-py releases the GIL on socket I/O,
+# so threads issue searches in parallel over the connection pool). Tunable via VSS_KNN_WORKERS.
+KNN_SEARCH_WORKERS = int(os.getenv("VSS_KNN_WORKERS", "16"))
 
 
 class VectorSimilarity:
@@ -60,3 +67,19 @@ class VectorSimilarity:
         except Exception as e:
             err(f"Error searching vector: {e}")
             return []
+
+    def search_vectors(self, vectors: list, top_n: int) -> list:
+        """Run KNN search for a batch of vectors concurrently.
+
+        Redis-py checks out a connection from the pool per command and releases the GIL
+        during socket I/O, so issuing searches from a thread pool avoids the serial
+        round-trip-per-vector cost. Results preserve input order.
+        """
+        if not vectors:
+            return []
+        if len(vectors) == 1:
+            return [self.search_vector(vectors[0], top_n)]
+
+        max_workers = min(KNN_SEARCH_WORKERS, len(vectors))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            return list(executor.map(lambda v: self.search_vector(v, top_n), vectors))

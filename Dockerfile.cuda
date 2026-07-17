@@ -27,6 +27,13 @@ RUN find /venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; \
     true
 
 # -----------------------------------------------------------------------------
+# Keep the lightweight CUDA "base" image. Do NOT use the "devel" image here: it
+# sets LD_LIBRARY_PATH=/usr/local/cuda/lib64, which shadows the CUDA libraries
+# bundled with the pip torch wheel and causes cuBLAS/cuBLASLt version mismatches
+# at runtime (CUBLAS_STATUS_NOT_INITIALIZED in cublasLtMatmulAlgoGetHeuristic).
+# torch and triton ship their own CUDA libs; the only host dependency the
+# optional VSS_TORCH_COMPILE (Inductor/Triton) path needs is a C/C++ compiler,
+# installed below.
 FROM nvidia/cuda:13.0.1-base-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 LABEL vendor="MBARI"
@@ -41,7 +48,8 @@ RUN apt-get update && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv \
+        python3.11 python3.11-venv python3.11-dev \
+        gcc g++ \
         curl libxcb1 libxcb-xinerama0 libxrender1 libxext6 libsm6 libice6 libgl1 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -56,6 +64,18 @@ ENV PYTHONPATH=${APP_HOME}/src:${APP_HOME}
 ENV IN_DOCKER=1
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Make the image uid-agnostic: the container may be run with an arbitrary uid
+# (e.g. compose `user: 12078:20`) that has no /etc/passwd entry. torch._dynamo,
+# imported transitively by transformers, calls getpass.getuser() at import time,
+# which raises KeyError on an unknown uid. Setting USER/HOME makes getpass short-
+# circuit on the env var, and routing torch/HF caches to world-writable /tmp keeps
+# them writable for any uid (needed for the optional VSS_TORCH_COMPILE path).
+ENV USER=appuser
+ENV HOME=/tmp
+ENV XDG_CACHE_HOME=/tmp/.cache
+ENV TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
+ENV TRITON_CACHE_DIR=/tmp/triton
 
 WORKDIR $APP_HOME
 COPY --from=builder /venv /venv

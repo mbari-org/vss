@@ -28,11 +28,32 @@ logger.addHandler(console)
 class ViTWrapper:
     def __init__(self, r: redis.Redis, device, model_name: str, reset: bool = False, batch_size: int = 32):
         self.r = r
-        self.device = device
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.batch_size = batch_size
         self.processor = AutoImageProcessor.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        # eval() disables dropout and puts the model in inference mode
+        self.model.eval()
+
+        # Mixed-precision (fp16) autocast roughly halves memory and ~2x GPU throughput.
+        # Only enabled on CUDA; can be disabled with VSS_AMP=0.
+        amp_enabled = os.getenv("VSS_AMP", "1") == "1"
+        self.amp_dtype = torch.float16 if (amp_enabled and self.device.type == "cuda") else None
+
         self.vs = VectorSimilarity(r, vector_dimensions=self.vector_dimensions, reset=reset)
+
+        # Optional torch.compile for a further speedup (one-time warmup cost).
+        # Done last so vector_dimensions is read from the original (uncompiled) module.
+        # Compilation is lazy (happens on the first forward), and its Inductor/Triton
+        # backend requires a C compiler + CUDA headers in the runtime image. If those
+        # are missing the first forward raises; we keep an eager reference so we can
+        # fall back gracefully instead of failing every prediction (see get_image_embeddings).
+        self._compiled = False
+        if os.getenv("VSS_TORCH_COMPILE", "0") == "1":
+            info("Compiling model with torch.compile")
+            self.model = torch.compile(self.model)
+            self._compiled = True
+
         if model_name.startswith("/"):
             if not os.path.exists(model_name):
                 raise FileNotFoundError(f"Model directory {model_name} does not exist")
@@ -66,18 +87,38 @@ class ViTWrapper:
             debug(f"Done preprocessing batch of {len(images)} images")
             yield inputs, valid_paths, failed_paths
 
+    def _forward(self, inputs):
+        """Run the model forward pass under inference_mode and optional fp16 autocast."""
+        with torch.inference_mode():
+            if self.amp_dtype is not None:
+                with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                    return self.model(**inputs)
+            return self.model(**inputs)
+
     def get_image_embeddings(self, inputs):
         """get embeddings for a batch of images"""
         debug(f"Getting embeddings for batch of size {inputs['pixel_values'].shape[0]}")
         debug(inputs["pixel_values"].shape)  # Should be (B, 3, H, W)
 
         # Move inputs to same device as model (processor returns CPU tensors)
-        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        inputs = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
-        with torch.no_grad():
-            embeddings = self.model(**inputs)
+        try:
+            embeddings = self._forward(inputs)
+        except Exception as e:
+            # torch.compile is lazy: Inductor/Triton kernel compilation happens on the
+            # first forward and can fail if the runtime lacks a C compiler/CUDA headers.
+            # Fall back to eager execution once instead of failing every prediction.
+            if self._compiled:
+                logger.warning(f"torch.compile forward failed ({e}); falling back to eager execution")
+                self.model = getattr(self.model, "_orig_mod", self.model)
+                self._compiled = False
+                embeddings = self._forward(inputs)
+            else:
+                raise
         info("Done getting embeddings for batch")
-        batch_embeddings = embeddings.last_hidden_state[:, 0, :].cpu().numpy()
+        # Cast back to float32 to match the Redis index (FLOAT32) regardless of autocast dtype
+        batch_embeddings = embeddings.last_hidden_state[:, 0, :].float().cpu().numpy()
         info(f"Batch embeddings shape: {batch_embeddings.shape}")
         return np.array(batch_embeddings)
 
@@ -91,8 +132,10 @@ class ViTWrapper:
         for inputs, _, _ in self.preprocess_images(image_paths):
             embeddings = self.get_image_embeddings(inputs)
             info(f"Searching for {len(embeddings)} embeddings in Redis")
-            for j, emb in enumerate(embeddings):
-                r = self.vs.search_vector(emb.tobytes(), top_n=top_n)
+            # Issue all KNN searches for the batch concurrently instead of one round-trip per image
+            vectors = [emb.tobytes() for emb in embeddings]
+            results = self.vs.search_vectors(vectors, top_n=top_n)
+            for r in results:
                 # Data is doc:label:id - split it into parts
                 data = [x["id"].split(":") for x in r]
                 batch_pred = []
