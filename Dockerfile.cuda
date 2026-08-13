@@ -16,8 +16,31 @@ ENV PATH="/venv/bin:$PATH"
 
 WORKDIR /app
 COPY src/requirements.txt src/requirements.txt
-RUN grep -vE '^(torch|torchvision)==' src/requirements.txt > /tmp/reqs-no-torch.txt && \
-    pip install --no-cache-dir -r /tmp/reqs-no-torch.txt && \
+# Drop the PyPI torch stack (and its hash continuation lines) so cu130 wheels
+# can be installed from download.pytorch.org without hash-check conflicts.
+RUN python3 <<'PY'
+from pathlib import Path
+
+skip = False
+out = []
+
+
+def keep(name: str) -> bool:
+    if name.startswith(("torch==", "torchvision==", "triton==", "cuda-bindings==", "cuda-pathfinder==")):
+        return False
+    if name.startswith("nvidia-") and not name.startswith("nvidia-ml-py=="):
+        return False
+    return True
+
+
+for line in Path("src/requirements.txt").read_text().splitlines(True):
+    if line[:1] not in " \t#" and line.strip():
+        skip = not keep(line)
+    if not skip:
+        out.append(line)
+Path("/tmp/reqs-no-torch.txt").write_text("".join(out))
+PY
+RUN pip install --no-cache-dir -r /tmp/reqs-no-torch.txt && \
     pip install --no-cache-dir https://github.com/redis/redis-py/archive/refs/tags/v5.0.9.zip && \
     pip install --no-cache-dir torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu130 && \
     pip install --no-cache-dir huggingface_hub==0.36.2
