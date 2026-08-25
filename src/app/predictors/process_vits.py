@@ -1,14 +1,16 @@
 # fastapi-vss, Apache-2.0 license
 # Filename: predictors/process_vits.py
 # Description: Process images with Vision Transformer (ViT) model and search by KNN embeddings in Redis vector store
+import io
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import redis  # type: ignore
 import torch
 from PIL import Image, ImageFile  # type: ignore
 from transformers import AutoModel, AutoImageProcessor  # type: ignore
-from typing import Iterator, List, Tuple
+from typing import Iterator, List, Optional, Tuple, Union
 
 from app.predictors.vector_similarity import VectorSimilarity
 
@@ -25,12 +27,62 @@ logger = logging.getLogger(__name__)
 logger.addHandler(console)
 
 
+# An image to embed: a filesystem path, or an in-memory buffer of encoded bytes.
+ImageSource = Union[str, bytes, io.BytesIO]
+
+
+def _default_decode_workers() -> int:
+    """Threads used to decode one batch (VSS_DECODE_WORKERS, default min(8, cpu count))."""
+    raw = os.getenv("VSS_DECODE_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning(f"Ignoring invalid VSS_DECODE_WORKERS={raw!r}")
+    return max(1, min(8, os.cpu_count() or 1))
+
+
+def _open_rgb(source: ImageSource) -> Image.Image:
+    """Decode one image from a path or an in-memory buffer into RGB."""
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
+    elif isinstance(source, io.IOBase):
+        source.seek(0)
+    img = Image.open(source)
+    # Force the decode here rather than lazily later: this call is what the thread pool is
+    # parallelizing, and PIL releases the GIL inside it.
+    img.load()
+    return img.convert("RGB")
+
+
 class ViTWrapper:
     def __init__(self, r: redis.Redis, device, model_name: str, reset: bool = False, batch_size: int = 32):
         self.r = r
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.batch_size = batch_size
-        self.processor = AutoImageProcessor.from_pretrained(model_name)
+        # transformers resolves a *slow* image processor when `use_fast` is unset, unless the
+        # checkpoint was saved with a fast one -- in 4.57 only Qwen2VL is force-upgraded
+        # (FORCE_FAST_IMAGE_PROCESSOR). The slow path resizes, rescales and normalizes one
+        # image at a time in Python/NumPy on the CPU, and it dominated batch latency: seconds
+        # per batch of 128 crops, all of it with the GPU idle. The torchvision-backed fast
+        # processor does the same work batched.
+        #
+        # Fast output differs very slightly (torchvision resize vs PIL), so embeddings shift
+        # a little; set VSS_FAST_PROCESSOR=0 to keep the old behaviour when querying a Redis
+        # index that was built with the slow processor.
+        want_fast = os.getenv("VSS_FAST_PROCESSOR", "1") == "1"
+        try:
+            self.processor = AutoImageProcessor.from_pretrained(model_name, use_fast=want_fast)
+        except Exception as e:
+            logger.warning(
+                f"Could not load image processor with use_fast={want_fast} ({e}); "
+                "falling back to the default processor"
+            )
+            self.processor = AutoImageProcessor.from_pretrained(model_name)
+        info(f"Image processor: {type(self.processor).__name__} (requested use_fast={want_fast})")
+
+        self.decode_workers = _default_decode_workers()
+        info(f"Image decode threads: {self.decode_workers}")
         self.model = AutoModel.from_pretrained(model_name).to(self.device)
         # eval() disables dropout and puts the model in inference mode
         self.model.eval()
@@ -62,30 +114,61 @@ class ViTWrapper:
     def vector_dimensions(self) -> int:
         return self.model.config.hidden_size
 
-    def preprocess_images(self, image_paths: List[str]) -> Iterator[Tuple[dict, List[str], List[str]]]:
-        debug(f"Preprocessing {len(image_paths)} images")
-        for i in range(0, len(image_paths), self.batch_size):
-            batch_paths = image_paths[i : i + self.batch_size]
+    def preprocess_images(
+        self,
+        image_sources: List[ImageSource],
+        labels: Optional[List[str]] = None,
+    ) -> Iterator[Tuple[dict, List[str], List[str]]]:
+        """
+        Decode images and run the processor, yielding one model-ready batch at a time.
+
+        `image_sources` may be filesystem paths or in-memory buffers of encoded bytes.
+        `labels` names each source for logging and for the failed-image report; it defaults
+        to the source itself, so passing a list of paths behaves exactly as before.
+
+        Yields (inputs, valid_labels, failed_labels).
+        """
+        debug(f"Preprocessing {len(image_sources)} images")
+        names = list(labels) if labels else [str(s) for s in image_sources]
+
+        def _safe_open(item: Tuple[ImageSource, str]) -> Optional[Image.Image]:
+            source, name = item
+            try:
+                return _open_rgb(source)
+            except Exception as e:
+                logger.warning(f"Skipping unreadable image {name}: {e}")
+                return None
+
+        for i in range(0, len(image_sources), self.batch_size):
+            batch = image_sources[i : i + self.batch_size]
+            batch_names = names[i : i + self.batch_size]
+
+            # Decode on a thread pool. PIL releases the GIL inside load(), so this scales
+            # with cores; done serially it cost seconds per batch of large crops, with the
+            # GPU sitting idle throughout. pool.map preserves order, which matters because
+            # embeddings are matched back to their inputs positionally.
+            workers = max(1, min(self.decode_workers, len(batch)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                decoded = list(pool.map(_safe_open, zip(batch, batch_names)))
+
             images = []
-            valid_paths = []
-            failed_paths = []
-            for p in batch_paths:
-                try:
-                    img = Image.open(p)
-                    img.load()
-                    images.append(img.convert("RGB"))
-                    valid_paths.append(p)
-                except Exception as e:
-                    logger.warning(f"Skipping unreadable image {p}: {e}")
-                    failed_paths.append(p)
+            valid_labels: List[str] = []
+            failed_labels: List[str] = []
+            for name, img in zip(batch_names, decoded):
+                if img is None:
+                    failed_labels.append(name)
+                else:
+                    images.append(img)
+                    valid_labels.append(name)
+
             if not images:
                 logger.warning(f"No valid images in batch starting at index {i}, skipping")
                 continue
-            if failed_paths:
-                logger.warning(f"Batch reduced from {len(batch_paths)} to {len(images)} images due to read errors")
+            if failed_labels:
+                logger.warning(f"Batch reduced from {len(batch)} to {len(images)} images due to read errors")
             inputs = self.processor(images=images, return_tensors="pt")
             debug(f"Done preprocessing batch of {len(images)} images")
-            yield inputs, valid_paths, failed_paths
+            yield inputs, valid_labels, failed_labels
 
     def _forward(self, inputs):
         """Run the model forward pass under inference_mode and optional fp16 autocast."""
@@ -122,7 +205,7 @@ class ViTWrapper:
         info(f"Batch embeddings shape: {batch_embeddings.shape}")
         return np.array(batch_embeddings)
 
-    def predict(self, image_paths: List[str], top_n: int = 1) -> tuple[list[list[str]], list[list[float]], list[list[str]]]:
+    def predict(self, image_paths: List[ImageSource], top_n: int = 1) -> tuple[list[list[str]], list[list[float]], list[list[str]]]:
         """Search using KNN for embeddings for a batch of images"""
         predictions = []
         scores = []
@@ -151,18 +234,18 @@ class ViTWrapper:
 
         return predictions, scores, ids
 
-    def get_embeddings(self, image_paths: List[str], filenames: List[str] | None = None) -> Tuple[List[List[float]], List[str]]:
+    def get_embeddings(self, image_sources: List[ImageSource], filenames: List[str] | None = None) -> Tuple[List[List[float]], List[str]]:
         """Get embeddings for a batch of images. Returns (embeddings, failed_filenames)."""
         all_embeddings = []
-        failed_paths: List[str] = []
-        path_to_filename = dict(zip(image_paths, filenames)) if filenames else {}
+        failed_filenames: List[str] = []
 
-        info(f"Found {len(image_paths)} images to get embeddings")
-        for inputs, valid_paths, batch_failed_paths in self.preprocess_images(image_paths):
-            failed_paths.extend(batch_failed_paths)
+        info(f"Found {len(image_sources)} images to get embeddings")
+        # Labels are the caller's filenames, so failures come back named without having to
+        # key a dict on the sources themselves (which may be anonymous in-memory buffers).
+        for inputs, _, batch_failed in self.preprocess_images(image_sources, labels=filenames):
+            failed_filenames.extend(batch_failed)
             embeddings = self.get_image_embeddings(inputs)
             for emb in embeddings:
                 all_embeddings.append(emb.tolist())
 
-        failed_filenames = [path_to_filename.get(p, p) for p in failed_paths]
         return all_embeddings, failed_filenames
