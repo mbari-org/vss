@@ -2,10 +2,10 @@
 # Filename: predictors/tasks.py
 # Description: Worker task file for processing images with Vision Transformer (ViT) models
 import gc
+import io
 import json
 import logging
 import os
-import tempfile
 import time
 import traceback
 from datetime import datetime
@@ -51,31 +51,32 @@ class MyWorker(SimpleWorker):
         return super().work(burst, logging_level)
 
 
-def _bytes_to_temp_paths(image_data: List[bytes], filenames: List[str]) -> List[str]:
-    """Write image bytes to temp files and return their paths. Caller must unlink paths when done."""
-    paths = []
-    for data, name in zip(image_data, filenames):
-        suffix = Path(name).suffix or ".png"
-        fd, path = tempfile.mkstemp(suffix=suffix)
-        try:
-            if hasattr(data, "read"):
-                data.seek(0)
-                raw = data.read()
-            else:
-                raw = data
-            os.write(fd, raw)
-        finally:
-            os.close(fd)
-        paths.append(path)
-    return paths
+def _to_image_buffers(image_data: List[bytes]) -> List[io.BytesIO]:
+    """
+    Wrap uploaded image bytes in in-memory buffers for the predictor.
+
+    These bytes arrive from the HTTP upload already in memory. The previous version wrote
+    every one of them to a temp file so PIL could read it straight back off disk, costing a
+    full write + read cycle per batch (seconds, for large crops) and leaving temp files to
+    unlink afterwards.
+    """
+    buffers = []
+    for data in image_data:
+        if hasattr(data, "read"):
+            data.seek(0)
+            raw = data.read()
+        else:
+            raw = data
+        buffers.append(io.BytesIO(raw))
+    return buffers
 
 
 def predict_on_cpu_or_gpu(v_config: dict, image_data: List[bytes], top_n: int, filenames: List[str]) -> dict:
-    temp_paths = _bytes_to_temp_paths(image_data, filenames)
+    buffers = _to_image_buffers(image_data)
     try:
-        logger.info(f"Predicting on {len(temp_paths)} images with top_n={top_n} using model {v_config['model']} on device {v_config['device']}")
+        logger.info(f"Predicting on {len(buffers)} images with top_n={top_n} using model {v_config['model']} on device {v_config['device']}")
         predictor = _predictor_stack.top
-        predictions, scores, ids = predictor.predict(temp_paths, top_n)
+        predictions, scores, ids = predictor.predict(buffers, top_n)
         gc.collect()
 
         # Use the current date and time (hourly granularity) for output directory and time with nanoseconds for the filename to ensure uniqueness
@@ -104,20 +105,14 @@ def predict_on_cpu_or_gpu(v_config: dict, image_data: List[bytes], top_n: int, f
         error_message = f"Error during prediction: {e}\n{traceback.format_exc()}"
         logger.info(error_message)
         return error_message
-    finally:
-        for p in temp_paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
 
 
 def get_embeddings_task(v_config: dict, image_data: List[bytes], filenames: List[str]) -> dict:
-    temp_paths = _bytes_to_temp_paths(image_data, filenames)
+    buffers = _to_image_buffers(image_data)
     try:
-        logger.info(f"Getting embeddings for {len(temp_paths)} images using model {v_config['model']} on device {v_config['device']}")
+        logger.info(f"Getting embeddings for {len(buffers)} images using model {v_config['model']} on device {v_config['device']}")
         predictor = _predictor_stack.top
-        embeddings, failed_filenames = predictor.get_embeddings(temp_paths, filenames)
+        embeddings, failed_filenames = predictor.get_embeddings(buffers, filenames)
         gc.collect()
 
         output_final = {
@@ -130,9 +125,4 @@ def get_embeddings_task(v_config: dict, image_data: List[bytes], filenames: List
         error_message = f"Error during embedding generation: {e}\n{traceback.format_exc()}"
         logger.info(error_message)
         return error_message
-    finally:
-        for p in temp_paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+
