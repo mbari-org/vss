@@ -2,6 +2,46 @@
 
 
 
+## v0.16.3 (2026-08-25)
+
+### Performance
+
+* perf(vits): cut per-batch preprocessing from seconds to a fraction (#17)
+
+&#34;Preprocessing 128 images&#34; took 10-13s per batch, all of it on the CPU with the
+GPU idle. Three causes, all addressed here.
+
+1. The image processor was the slow one. AutoImageProcessor.from_pretrained()
+   with `use_fast` unset resolves to the slow processor unless the checkpoint was
+   saved with a fast one -- in transformers 4.57 only Qwen2VL is force-upgraded
+   (FORCE_FAST_IMAGE_PROCESSOR). The slow path resizes, rescales and normalizes
+   one image at a time in Python/NumPy. Request the torchvision-backed fast
+   processor instead, and log which class was actually loaded so this is visible
+   at startup. Fast output differs very slightly (torchvision resize vs PIL), so
+   VSS_FAST_PROCESSOR=0 restores the old behaviour for a Redis index built with
+   the slow processor.
+
+2. Images were decoded one at a time. PIL releases the GIL inside load(), so the
+   batch now decodes on a thread pool (VSS_DECODE_WORKERS, default min(8, cpu)).
+   Measured 2.8x on a 2-core box for 128 1024px crops; more with more cores.
+
+3. Every uploaded image was written to a temp file so PIL could read it straight
+   back off disk, despite the bytes already being in memory from the HTTP
+   upload. Pass in-memory buffers instead, which also removes the temp-file
+   cleanup path entirely.
+
+preprocess_images() now takes paths or in-memory buffers, plus optional labels
+used for logging and the failed-image report. Passing a list of paths behaves
+exactly as before, so predict_from_list.py and tests/load.py are unaffected.
+pool.map preserves order, which matters because embeddings are matched back to
+their inputs positionally.
+
+
+Claude-Session: https://claude.ai/code/session_019s65VkcHwERBZrXXpaivVy
+
+Co-authored-by: Claude &lt;noreply@anthropic.com&gt; ([`130e80c`](https://github.com/mbari-org/vss/commit/130e80c58d1215be4752eb0cb2e20cbd45a5f8b3))
+
+
 ## v0.16.2 (2026-08-25)
 
 ### Fix
