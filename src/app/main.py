@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import warnings
 
 import redis
@@ -73,10 +74,18 @@ if len(config) == 0:
 queues = {}
 connections = {}
 
-# WebSocket poll interval in seconds - short enough to be responsive, avoids hammering Redis
-WS_POLL_INTERVAL = 0.5
-# Maximum time to wait for a job to complete before closing the WebSocket
-WS_MAX_WAIT = 300  # 5 minutes
+# WebSocket poll interval in seconds - short enough to be responsive, avoids hammering Redis.
+# This doubles as the heartbeat interval: a client cannot distinguish a slow job from a dead
+# connection by the job's duration, only by the gap between frames, so it must stay well below
+# whatever idle timeout clients use (fiftyone-sync: FASTVSS_WS_IDLE_TIMEOUT, default 120s).
+WS_POLL_INTERVAL = float(os.getenv("WS_POLL_INTERVAL", "0.5"))
+# Maximum time to wait for a job to complete before closing the WebSocket.
+#
+# Jobs are processed by a single serial RQ worker per project (see start_worker.py), so a job
+# submitted while several others are queued ahead of it legitimately waits for all of them.
+# The old 300s was well under what a backed-up queue needs and cut clients off mid-job. Keep
+# this at or above the client's own per-job budget, or the client's budget is meaningless.
+WS_MAX_WAIT = float(os.getenv("WS_MAX_WAIT", "1800"))
 
 for project in config.keys():
     redis_host = config[project]["redis_host"]
@@ -219,14 +228,19 @@ async def get_job_result(job_id: str, project: str = DEFAULT_PROJECT):
 
     try:
         # Check if the job ID is valid
-        if not Job.exists(job_id, connection=connections[project]):
+        if not await asyncio.to_thread(
+            Job.exists, job_id, connection=connections[project]
+        ):
             return {"error": f"Job ID {job_id} does not exist in project {project}"}
 
         redis_conn = connections[project]
         info(f"Fetching job status for job ID {job_id} in project {project}")
-        job = Job.fetch(job_id, connection=redis_conn)
+        job = await asyncio.to_thread(Job.fetch, job_id, connection=redis_conn)
         if job.is_finished:
-            return {"status": "done", "result": job.return_value()}
+            return {
+                "status": "done",
+                "result": await asyncio.to_thread(job.return_value),
+            }
         elif job.is_failed:
             return {"status": "failed"}
         else:
@@ -252,31 +266,53 @@ async def ws_job_result(websocket: WebSocket, job_id: str, project: str = DEFAUL
 
     redis_conn = connections[project]
 
-    if not Job.exists(job_id, connection=redis_conn):
+    # Job.exists / Job.fetch / job.return_value() are blocking redis-py calls, and this is an
+    # async endpoint sharing one event loop with every other request this process is serving.
+    # Running them inline stalls all of those -- including the heartbeat frames other clients
+    # rely on to tell a slow job from a dead connection -- so they go to a worker thread.
+    # redis-py clients are thread-safe (they hold a connection pool), as is unpickling a
+    # result, which for a batch of embeddings is itself far from free.
+    if not await asyncio.to_thread(Job.exists, job_id, connection=redis_conn):
         await websocket.send_text(json.dumps({"status": "error", "message": f"Job ID {job_id} does not exist in project {project}"}))
         await websocket.close()
         return
 
-    elapsed = 0.0
+    # Wall-clock, not a count of loop iterations. Incrementing a counter by WS_POLL_INTERVAL
+    # (as this used to) measures only the sleeps and ignores how long each Redis round-trip
+    # took, so the effective limit drifted arbitrarily far past WS_MAX_WAIT under load --
+    # exactly when an accurate limit matters.
+    start = time.monotonic()
     try:
-        while elapsed < WS_MAX_WAIT:
-            job = Job.fetch(job_id, connection=redis_conn)
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed >= WS_MAX_WAIT:
+                info(f"WebSocket job {job_id} timed out in project {project} after {elapsed:.0f}s")
+                await websocket.send_text(json.dumps({
+                    "status": "error",
+                    "message": f"Timed out waiting for job after {elapsed:.0f}s",
+                }))
+                break
+
+            job = await asyncio.to_thread(Job.fetch, job_id, connection=redis_conn)
 
             if job.is_finished:
-                info(f"WebSocket job {job_id} finished in project {project}")
-                await websocket.send_text(json.dumps({"status": "done", "result": job.return_value()}))
+                info(f"WebSocket job {job_id} finished in project {project} after {elapsed:.0f}s")
+                result = await asyncio.to_thread(job.return_value)
+                await websocket.send_text(json.dumps({"status": "done", "result": result}))
                 break
             elif job.is_failed:
-                info(f"WebSocket job {job_id} failed in project {project}")
-                await websocket.send_text(json.dumps({"status": "failed"}))
+                info(f"WebSocket job {job_id} failed in project {project} after {elapsed:.0f}s")
+                await websocket.send_text(json.dumps({
+                    "status": "failed",
+                    "message": f"Job {job_id} failed in project {project}",
+                }))
                 break
             else:
+                # Heartbeat. Clients time out on the gap between frames, so this must keep
+                # flowing for the whole wait, however long the job itself takes.
                 await websocket.send_text(json.dumps({"status": "pending"}))
 
             await asyncio.sleep(WS_POLL_INTERVAL)
-            elapsed += WS_POLL_INTERVAL
-        else:
-            await websocket.send_text(json.dumps({"status": "error", "message": "Timed out waiting for job"}))
     except WebSocketDisconnect:
         debug(f"WebSocket client disconnected for job {job_id} in project {project}")
     except Exception as e:
