@@ -9,9 +9,10 @@ import numpy as np
 import redis  # type: ignore
 import torch
 from PIL import Image, ImageFile  # type: ignore
-from transformers import AutoModel, AutoImageProcessor  # type: ignore
+from transformers import AutoImageProcessor  # type: ignore
 from typing import Iterator, List, Optional, Tuple, Union
 
+from app.predictors.load_model import load_vision_model
 from app.predictors.vector_similarity import VectorSimilarity
 
 import logging
@@ -74,16 +75,13 @@ class ViTWrapper:
         try:
             self.processor = AutoImageProcessor.from_pretrained(model_name, use_fast=want_fast)
         except Exception as e:
-            logger.warning(
-                f"Could not load image processor with use_fast={want_fast} ({e}); "
-                "falling back to the default processor"
-            )
+            logger.warning(f"Could not load image processor with use_fast={want_fast} ({e}); falling back to the default processor")
             self.processor = AutoImageProcessor.from_pretrained(model_name)
         info(f"Image processor: {type(self.processor).__name__} (requested use_fast={want_fast})")
 
         self.decode_workers = _default_decode_workers()
         info(f"Image decode threads: {self.decode_workers}")
-        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        self.model = load_vision_model(model_name).to(self.device)
         # eval() disables dropout and puts the model in inference mode
         self.model.eval()
 
