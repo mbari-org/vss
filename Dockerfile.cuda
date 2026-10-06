@@ -1,6 +1,8 @@
 # ================================================================
 #  Docker image for fastapi-vss (CUDA 13, deploy: multi-stage + non-root)
 # ================================================================
+ARG GIT_VERSION=latest
+
 FROM nvidia/cuda:13.0.1-runtime-ubuntu22.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
@@ -59,12 +61,11 @@ RUN find /venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; \
 # installed below.
 FROM nvidia/cuda:13.0.1-base-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
+ARG GIT_VERSION=latest
 LABEL vendor="MBARI"
 LABEL maintainer="dcline@mbari.org"
 LABEL license="Apache License 2.0"
-
-ARG UID=1001
-ARG GID=1001
+LABEL org.opencontainers.image.version="${GIT_VERSION}"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends software-properties-common && \
@@ -75,9 +76,6 @@ RUN apt-get update && \
         gcc g++ \
         curl libxcb1 libxcb-xinerama0 libxrender1 libxext6 libsm6 libice6 libgl1 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd --gid ${GID} appuser && \
-    useradd --uid ${UID} --gid ${GID} --no-create-home appuser
 
 ENV PATH="/venv/bin:$PATH"
 ENV APP_HOME=/app
@@ -94,7 +92,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 # which raises KeyError on an unknown uid. Setting USER/HOME makes getpass short-
 # circuit on the env var, and routing torch/HF caches to world-writable /tmp keeps
 # them writable for any uid (needed for the optional VSS_TORCH_COMPILE path).
-ENV USER=appuser
+ENV USER=mldevops
 ENV HOME=/tmp
 ENV XDG_CACHE_HOME=/tmp/.cache
 ENV TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
@@ -104,9 +102,13 @@ WORKDIR $APP_HOME
 COPY --from=builder /venv /venv
 COPY . .
 
-RUN chown -R appuser:appuser /app /venv
+# Match MBARI host user mldevops (uid 12078, gid 20)
+RUN (getent group 20 || groupadd -g 20 appgroup) && \
+    useradd -u 12078 -g 20 -m -s /bin/bash mldevops && \
+    mkdir -p /tmp/transformers_cache /tmp/logs && \
+    chown -R mldevops:20 $APP_HOME /venv /tmp/transformers_cache /tmp/logs
 
-USER ${UID}:${GID}
+USER mldevops
 
 ARG NUM_WORKERS=1
 ENV NUM_WORKERS=${NUM_WORKERS}

@@ -2,6 +2,51 @@
 
 
 
+## v0.16.2 (2026-08-25)
+
+### Fix
+
+* fix(ws): keep the job-status socket responsive and bound it by real time (#15)
+
+Clients embedding a dataset through /embed + /ws/predict/job saw bursts of
+inter-frame timeouts as soon as more than a couple of batches were in flight.
+Two defects on this side contributed.
+
+1. Blocking Redis calls ran inline on the event loop.
+   Job.exists, Job.fetch and job.return_value() are synchronous redis-py calls,
+   and ws_job_result is an async endpoint sharing one event loop with every
+   other connection this process serves. Under N concurrent job sockets each
+   polling at 1/WS_POLL_INTERVAL, plus concurrent multipart uploads, the loop
+   spent its time inside Redis round-trips and unpickling embedding payloads --
+   delaying the very heartbeat frames clients use to distinguish a slow job
+   from a dead connection, and so causing the timeouts it was meant to prevent.
+   All three now go through asyncio.to_thread; redis-py clients are thread-safe
+   (they hold a connection pool), as is unpickling a result.
+
+2. WS_MAX_WAIT counted loop iterations, not elapsed time.
+   `elapsed += WS_POLL_INTERVAL` measured only the sleeps and ignored how long
+   each Redis round-trip took, so the effective limit drifted arbitrarily far
+   past WS_MAX_WAIT under load -- exactly when a real bound matters. It is now
+   a time.monotonic() deadline, and the timeout frame reports how long it
+   actually waited.
+
+WS_MAX_WAIT and WS_POLL_INTERVAL are now environment-configurable, and the
+default wait is raised from 300s to 1800s: jobs are processed by a single
+serial RQ worker per project, so a job submitted while several others are
+queued ahead of it legitimately waits for all of them, and 300s cut clients off
+mid-job. A failed job now names itself in the message instead of sending a bare
+{&#34;status&#34;: &#34;failed&#34;}.
+
+Note this does not raise throughput -- one worker per project still processes
+jobs serially, so client-side concurrency only queues them faster. Scaling the
+rq-worker service is the lever for that.
+
+
+Claude-Session: https://claude.ai/code/session_019s65VkcHwERBZrXXpaivVy
+
+Co-authored-by: Claude &lt;noreply@anthropic.com&gt; ([`604ae20`](https://github.com/mbari-org/vss/commit/604ae202cf6753df4fc187fd7c424508e5a363cc))
+
+
 ## v0.16.1 (2026-07-17)
 
 ### Performance
