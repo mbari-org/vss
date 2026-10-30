@@ -2,6 +2,18 @@
 
 
 
+## v0.16.4 (2026-10-30)
+
+### Fix
+
+* fix: load DINOv3 BackboneClassifier checkpoints in VSS (#18)
+
+AutoModel cannot resolve model_type backbone_classifier from sslvitstrain
+fine-tunes. Rebuild the backbone from the saved config and drop the head.
+
+Co-authored-by: Cursor &lt;cursoragent@cursor.com&gt; ([`3954d1a`](https://github.com/mbari-org/vss/commit/3954d1ab52d8e717cd5f6241db629a1913371d0c))
+
+
 ## v0.16.3 (2026-08-25)
 
 ### Performance
